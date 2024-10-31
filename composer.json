@@ -1,0 +1,33 @@
+{
+    "name": "tudorr89/phpqdrv",
+    "description": "A simple queue system supporting multiple backends for PHP",
+    "type": "library",
+    "license": "MIT",
+    "autoload": {
+        "psr-4": {
+            "Tudorr89\\Phpqdrv\\": "src/"
+        }
+    },
+    "require": {
+        "php": "^8.1",
+        "predis/predis": "^2.0",
+        "ext-pdo": "*",
+        "pear/net_beanstalkd": "^0.5.1",
+        "php-di/php-di": "^7.0"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^9.5",
+        "mockery/mockery": "^1.4"
+    },
+    "suggest": {
+        "ext-redis": "For using Redis queue driver",
+        "ext-pgsql": "For using PostgreSQL queue driver",
+        "ext-sqlite3": "For using SQLite queue driver"
+    },
+    "authors": [
+        {
+            "name": "Tudor Rusu",
+            "email": "tudorr89@gmail.com"
+        }
+    ]
+}
