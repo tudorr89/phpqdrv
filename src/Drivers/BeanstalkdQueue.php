@@ -1,108 +1,170 @@
 <?php
 
-namespace Tudorr89\Phpqdrv\Drivers;
+declare(strict_types=1);
 
-use Net_Beanstalkd;
-use Tudorr89\Phpqdrv\Contracts\JobInterface;
-use Tudorr89\Phpqdrv\Contracts\QueueInterface;
-use Tudorr89\Phpqdrv\Job;
+namespace RTIGLOBAL\Phpqdrv\Drivers;
 
-class BeanstalkdQueue implements QueueInterface
+use RTIGLOBAL\Phpqdrv\Contracts\BeanstalkdConnectionInterface;
+use RTIGLOBAL\Phpqdrv\Contracts\JobInterface;
+use RTIGLOBAL\Phpqdrv\Contracts\QueueInterface;
+use RTIGLOBAL\Phpqdrv\Exception\InvalidPayloadException;
+use RTIGLOBAL\Phpqdrv\Exception\UnknownJobException;
+use RTIGLOBAL\Phpqdrv\Job;
+use RTIGLOBAL\Phpqdrv\Support\Id;
+use RTIGLOBAL\Phpqdrv\Support\Json;
+
+/**
+ * Beanstalkd backed queue.
+ *
+ * Beanstalkd addresses jobs by a server assigned integer id, while the queue
+ * package exposes string job ids. The mapping is kept in memory, which mirrors
+ * how Beanstalkd is meant to be used: a job is reserved, handled and deleted by
+ * the same process. A job reserved by a process that then dies is recovered by
+ * the server itself once its TTR expires, hence `requeueExpired()` is a no-op.
+ *
+ * Because `release` cannot change a job body, retrying deletes the reserved job
+ * and publishes a new one carrying the incremented attempt counter.
+ */
+final class BeanstalkdQueue implements QueueInterface
 {
-    private Net_Beanstalkd $connection;
+    /** @var array<string, string> package job id => server job id */
+    private array $handles = [];
 
-    public function __construct(Net_Beanstalkd $connection)
-    {
-        $this->connection = $connection;
+    public function __construct(
+        private readonly BeanstalkdConnectionInterface $connection,
+        private readonly int $priority = 1024,
+        private readonly int $ttr = 120,
+        private readonly int $reserveTimeout = 1,
+        private readonly string $failedTubeSuffix = '.failed',
+    ) {
+        if ($ttr < 1) {
+            throw new \InvalidArgumentException('ttr must be at least 1 second.');
+        }
+
+        if ($reserveTimeout < 0) {
+            throw new \InvalidArgumentException('reserveTimeout must not be negative.');
+        }
     }
 
-    public function push(string $queue, array $payload): JobInterface
+    public function push(string $queue, array $payload, int $delay = 0): JobInterface
     {
-        // Ensure the tube (queue) exists
-        $this->connection->useTube($queue);
+        $id = Id::generate();
+        $body = $this->encode($id, 0, $payload);
 
-        $jobId = uniqid('job_', true);
-
-        // Create job data including metadata
-        $jobData = [
-            'id' => $jobId,
-            'payload' => $payload,
-            'attempts' => 0
-        ];
-
-        // Put the job in the queue with a default priority and delay
-        $beanstalkdJobId = $this->connection->put(
-            json_encode($jobData),
-            1024, // priority (lower number = higher priority)
-            0,    // delay in seconds
-            120   // time to run (TTR) in seconds
+        $this->handles[$id] = $this->connection->putInTube(
+            $queue,
+            $body,
+            $this->priority,
+            max(0, $delay),
+            $this->ttr
         );
 
-        return new Job($jobId, $queue, $payload);
+        return new Job($id, $queue, $payload, 0, $body);
     }
 
     public function pop(string $queue): ?JobInterface
     {
-        // Watch the specific tube (queue)
-        $this->connection->watch($queue);
-        $this->connection->ignore('default');
+        $reserved = $this->connection->reserveFromTube($queue, $this->reserveTimeout);
 
-        // Reserve a job
-        $beanstalkdJob = $this->connection->reserve(1); // 1-second timeout
-
-        if (!$beanstalkdJob) {
+        if ($reserved === null) {
             return null;
         }
 
-        // Decode the job data
-        $jobData = json_decode($beanstalkdJob->getData(), true);
+        $raw = $reserved->getData();
 
-        // Increment attempts
-        $jobData['attempts']++;
+        try {
+            $data = Json::decode($raw);
+            $payload = $data['payload'] ?? null;
 
-        return new Job(
-            $jobData['id'],
-            $queue,
-            $jobData['payload'],
-            $jobData['attempts']
-        );
+            if (!is_array($payload)) {
+                throw new InvalidPayloadException('Beanstalkd job body is missing an array payload.');
+            }
+        } catch (InvalidPayloadException $e) {
+            // Never leave a corrupt job reserved: it would be redelivered forever.
+            $this->connection->delete($reserved->getId());
+
+            throw $e;
+        }
+
+        $id = isset($data['id']) && is_string($data['id']) ? $data['id'] : $reserved->getId();
+
+        $this->handles[$id] = $reserved->getId();
+
+        return new Job($id, $queue, $payload, (int) ($data['attempts'] ?? 0) + 1, $raw);
     }
 
     public function ack(JobInterface $job): void
     {
-        try {
-            $this->connection->delete($job->getId());
-        } catch (\Exception $e) {
-            // Job might have already been deleted or doesn't exist
-        }
+        $this->connection->delete($this->handle($job));
+        unset($this->handles[$job->getId()]);
     }
 
     public function fail(JobInterface $job): void
     {
-        try {
-            // Move to a failed tube/queue
-            $this->connection->useTube("failed_{$job->getQueue()}");
-            $this->connection->put(
-                json_encode([
-                    'original_id' => $job->getId(),
-                    'payload' => $job->getPayload(),
-                    'failed_at' => time()
-                ])
-            );
+        $this->connection->putInTube(
+            $job->getQueue() . $this->failedTubeSuffix,
+            Json::encode([
+                'original_id' => $job->getId(),
+                'payload' => $job->getPayload(),
+                'attempts' => $job->getAttempts(),
+                'failed_at' => time(),
+            ]),
+            $this->priority,
+            0,
+            $this->ttr
+        );
 
-            // Delete the original job
-            $this->connection->delete($job->getId());
-        } catch (\Exception $e) {
-            // Handle potential errors during failure processing
-        }
+        $this->connection->delete($this->handle($job));
+        unset($this->handles[$job->getId()]);
     }
 
-    public function count(string $queue): int
+    public function release(JobInterface $job, int $delay = 0): void
     {
-        // Watch the tube to get its stats
-        $this->connection->watch($queue);
-        $stats = $this->connection->statsTube($queue);
+        $serverId = $this->handle($job);
 
-        return $stats['current-jobs-ready'] ?? 0;
+        $this->connection->delete($serverId);
+
+        $this->handles[$job->getId()] = $this->connection->putInTube(
+            $job->getQueue(),
+            $this->encode($job->getId(), $job->getAttempts(), $job->getPayload()),
+            $this->priority,
+            max(0, $delay),
+            $this->ttr
+        );
+    }
+
+    public function size(string $queue): int
+    {
+        return $this->connection->tubeSize($queue);
+    }
+
+    public function requeueExpired(): int
+    {
+        // The server releases jobs whose TTR expired on its own.
+        return 0;
+    }
+
+    private function handle(JobInterface $job): string
+    {
+        if (!isset($this->handles[$job->getId()])) {
+            throw new UnknownJobException(sprintf(
+                'No Beanstalkd handle known for job "%s". Jobs can only be acked, failed or released by the process that reserved them.',
+                $job->getId()
+            ));
+        }
+
+        return $this->handles[$job->getId()];
+    }
+
+    /**
+     * @param array<array-key, mixed> $payload
+     */
+    private function encode(string $id, int $attempts, array $payload): string
+    {
+        return Json::encode([
+            'id' => $id,
+            'attempts' => $attempts,
+            'payload' => $payload,
+        ]);
     }
 }

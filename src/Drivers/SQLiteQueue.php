@@ -1,107 +1,77 @@
 <?php
 
-namespace Tudorr89\Phpqdrv\Drivers;
+declare(strict_types=1);
+
+namespace RTIGLOBAL\Phpqdrv\Drivers;
 
 use PDO;
-use Tudorr89\Phpqdrv\Contracts\JobInterface;
-use Tudorr89\Phpqdrv\Contracts\QueueInterface;
-use Tudorr89\Phpqdrv\Job;
 
-class SQLiteQueue implements QueueInterface
+/**
+ * SQLite backed queue.
+ *
+ * SQLite has no row level locking, so writers are serialised with
+ * `BEGIN IMMEDIATE`; the guarded UPDATE in the base class then guarantees that
+ * a row is claimed exactly once even if several processes race.
+ */
+final class SQLiteQueue extends AbstractPdoQueue
 {
-    private PDO $pdo;
-
-    public function __construct(PDO $pdo)
+    protected function configureConnection(): void
     {
-        $this->pdo = $pdo;
-        $this->createQueueTable();
-    }
+        $this->pdo->exec('PRAGMA busy_timeout = 5000');
+        $this->pdo->exec('PRAGMA foreign_keys = ON');
 
-    private function createQueueTable(): void
-    {
-        $this->pdo->exec("
-            CREATE TABLE IF NOT EXISTS queue_jobs (
-                id TEXT PRIMARY KEY,
-                queue TEXT,
-                payload TEXT,
-                attempts INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'pending',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ");
-    }
-
-    public function push(string $queue, array $payload): JobInterface
-    {
-        $jobId = uniqid('job_', true);
-        $stmt = $this->pdo->prepare(
-            "INSERT INTO queue_jobs (id, queue, payload) VALUES (?, ?, ?)"
-        );
-        $stmt->execute([$jobId, $queue, json_encode($payload)]);
-
-        return new Job($jobId, $queue, $payload);
-    }
-
-    public function pop(string $queue): ?JobInterface
-    {
-        $this->pdo->beginTransaction();
+        // WAL allows readers and a writer to coexist. It is a no-op for
+        // in-memory databases, hence the belt-and-braces try/catch.
         try {
-            $stmt = $this->pdo->prepare("
-                SELECT * FROM queue_jobs
-                WHERE queue = ? AND status = 'pending'
-                ORDER BY created_at ASC
-                LIMIT 1
-            ");
-            $stmt->execute([$queue]);
-            $job = $stmt->fetch(PDO::FETCH_ASSOC);
-
-            if (!$job) {
-                $this->pdo->rollBack();
-                return null;
-            }
-
-            $updateStmt = $this->pdo->prepare(
-                "UPDATE queue_jobs SET attempts = attempts + 1, status = 'processing' WHERE id = ?"
-            );
-            $updateStmt->execute([$job['id']]);
-
-            $this->pdo->commit();
-
-            return new Job(
-                $job['id'],
-                $queue,
-                json_decode($job['payload'], true),
-                $job['attempts']
-            );
-        } catch (\Exception $e) {
-            $this->pdo->rollBack();
-            throw $e;
+            $this->pdo->exec('PRAGMA journal_mode = WAL');
+        } catch (\PDOException) {
+            // Non-fatal: fall back to the default rollback journal.
         }
     }
 
-    public function ack(JobInterface $job): void
+    /** @return list<string> */
+    /** @return list<string> */
+    protected function schemaStatements(): array
     {
-        $stmt = $this->pdo->prepare(
-            "UPDATE queue_jobs SET status = 'completed' WHERE id = ?"
-        );
-        $stmt->execute([$job->getId()]);
+        return [
+            'CREATE TABLE IF NOT EXISTS queue_jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                queue TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT \'pending\',
+                available_at INTEGER NOT NULL DEFAULT 0,
+                reserved_at INTEGER NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )',
+            'CREATE INDEX IF NOT EXISTS queue_jobs_pop_idx
+                ON queue_jobs (queue, status, available_at, created_at)',
+        ];
     }
 
-    public function fail(JobInterface $job): void
+    protected function beginTransaction(): void
     {
-        $stmt = $this->pdo->prepare(
-            "UPDATE queue_jobs SET status = 'failed' WHERE id = ?"
-        );
-        $stmt->execute([$job->getId()]);
+        $this->pdo->exec('BEGIN IMMEDIATE');
     }
 
-    public function count(string $queue): int
+    protected function commit(): void
     {
-        $stmt = $this->pdo->prepare(
-            "SELECT COUNT(*) FROM queue_jobs WHERE queue = ? AND status = 'pending'"
-        );
-        $stmt->execute([$queue]);
-        return $stmt->fetchColumn();
+        $this->pdo->exec('COMMIT');
+    }
+
+    protected function rollback(): void
+    {
+        try {
+            $this->pdo->exec('ROLLBACK');
+        } catch (\PDOException) {
+            // No transaction was active.
+        }
+    }
+
+    /** Handy for tests and tooling. */
+    public function connection(): PDO
+    {
+        return $this->pdo;
     }
 }

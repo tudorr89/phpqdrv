@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: 'yes'
+          MARIADB_DATABASE: phpqdrv_test
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mariadb-admin ping -h 127.0.0.1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ''
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: phpqdrv_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4']
+
+    env:
+      QDRV_REDIS_DSN: redis://127.0.0.1:6379
+      QDRV_MYSQL_DSN: 'mysql:host=127.0.0.1;port=3306;dbname=phpqdrv_test'
+      QDRV_MYSQL_USER: root
+      QDRV_MYSQL_PASSWORD: ''
+      QDRV_PGSQL_DSN: 'pgsql:host=127.0.0.1;port=5432;dbname=phpqdrv_test'
+      QDRV_PGSQL_USER: postgres
+      QDRV_PGSQL_PASSWORD: ''
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo, pdo_sqlite, pdo_mysql, pdo_pgsql, pcntl
+          coverage: none
+
+      - run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Tests
+        run: vendor/bin/phpunit --no-coverage
+
+      - name: Static analysis
+        if: matrix.php == '8.4'
+        run: vendor/bin/phpstan analyse --no-progress

@@ -1,22 +1,39 @@
 <?php
 
-namespace Tudorr89\Phpqdrv;
+declare(strict_types=1);
 
-use Tudorr89\Phpqdrv\Contracts\JobInterface;
+namespace RTIGLOBAL\Phpqdrv;
 
+use RTIGLOBAL\Phpqdrv\Contracts\JobInterface;
+use RTIGLOBAL\Phpqdrv\Support\Id;
+
+/**
+ * Immutable value object describing a queue job.
+ *
+ * The optional `$raw` string is the exact serialised representation the driver
+ * reserved. Drivers that address jobs by their serialised body (Redis) need
+ * the untouched bytes to ack/release reliably.
+ */
 class Job implements JobInterface
 {
-    private string $id;
-    private string $queue;
-    private array $payload;
-    private int $attempts;
+    /**
+     * @param array<array-key, mixed> $payload
+     */
+    public function __construct(
+        private readonly string $id,
+        private readonly string $queue,
+        private readonly array $payload,
+        private readonly int $attempts = 0,
+        private readonly ?string $raw = null,
+    ) {
+    }
 
-    public function __construct(string $id, string $queue, array $payload, int $attempts = 0)
+    /**
+     * @param array<array-key, mixed> $payload
+     */
+    public static function create(string $queue, array $payload): self
     {
-        $this->id = $id;
-        $this->queue = $queue;
-        $this->payload = $payload;
-        $this->attempts = $attempts;
+        return new self(Id::generate(), $queue, $payload);
     }
 
     public function getId(): string
@@ -24,6 +41,9 @@ class Job implements JobInterface
         return $this->id;
     }
 
+    /**
+     * @return array<array-key, mixed>
+     */
     public function getPayload(): array
     {
         return $this->payload;
@@ -39,13 +59,9 @@ class Job implements JobInterface
         return $this->attempts;
     }
 
-    public function markAsFailed(): void
+    /** Driver internal: the serialised form this job was reserved from. */
+    public function getRaw(): ?string
     {
-        // This method can be implemented by the queue driver
-    }
-
-    public function markAsCompleted(): void
-    {
-        // This method can be implemented by the queue driver
+        return $this->raw;
     }
 }

@@ -1,157 +1,206 @@
-# Simple PHP Queue Package
+# phpqdrv
 
-A flexible PHP queue management system supporting multiple backend drivers.
+A small, dependency-light queue system for PHP with interchangeable backends.
 
-## 🚀 Features
-
-- Multiple queue backend support
-  - Redis
-  - MariaDB
-  - PostgreSQL
-  - SQLite
-  - Beanstalkd
-- Robust job processing
-- Configurable retry mechanisms
-- Extensible architecture
-
-## 📦 Installation
-
-Install the package using Composer:
-
-```bash
-composer require tudorr89/phpqdrv
+```
+RTIGLOBAL\Phpqdrv
 ```
 
-## 🔧 Requirements
+## Features
+
+- **Five drivers**: Redis, MariaDB/MySQL, PostgreSQL, SQLite, Beanstalkd
+- **Nothing is silently lost**: reserved jobs are recovered if a worker dies
+- **Real retries**: failed jobs are released with exponential backoff, then parked in a dead letter store
+- **Atomic claims**: no two workers can ever handle the same job (Lua scripts for Redis, `SKIP LOCKED` / guarded updates for SQL databases)
+- **Delayed jobs** (`push($queue, $payload, $delay)`)
+- **Optional dependencies**: predis and Pheanstalk are `suggest`-ed; the package itself only needs `ext-pdo` + `psr/log`
+- **PSR-3 logging**, graceful `SIGTERM`/`SIGINT` shutdown, static analysis clean at PHPStan level 8
+
+## Requirements
 
 - PHP 8.1+
-- Supported database extensions based on chosen driver
+- `ext-pdo` and the matching PDO driver (`pdo_sqlite`, `pdo_mysql`, `pdo_pgsql`)
+- `ext-pcntl` (optional, for graceful shutdown)
 
-## 💡 Usage Examples
+## Installation
 
-### Redis Queue
+```bash
+composer require rtiglobal/phpqdrv
+```
+
+Then install the client for the backend you actually use:
+
+```bash
+composer require predis/predis   # Redis
+composer require pda/pheanstalk  # Beanstalkd
+```
+
+## Quick start
+
+### SQLite
 
 ```php
-<?php
-use Predis\Client;
-use Tudorr89\Phpqdrv\QueueFactory;
-use Tudorr89\Phpqdrv\Worker;
+use RTIGLOBAL\Phpqdrv\QueueFactory;
+use RTIGLOBAL\Phpqdrv\Worker;
 
-// Create Redis connection
-$redis = new Client([
-    'host' => '127.0.0.1',
-    'port' => 6379
-]);
+$pdo = new PDO('sqlite:' . __DIR__ . '/queue.sqlite');
+$queue = QueueFactory::sqlite($pdo);
 
-// Create queue instance
-$queue = QueueFactory::createRedisQueue($redis);
+$queue->push('emails', ['to' => 'user@example.com', 'subject' => 'Welcome']);
 
-// Enqueue a job
-$job = $queue->push('emails', [
-    'to' => 'user@example.com',
-    'subject' => 'Welcome',
-    'body' => 'Hello World!'
-]);
-
-// Create a worker
-$worker = new Worker($queue);
-
-// Process jobs
-$worker->work('emails', function($payload) {
-    sendEmail(
-        $payload['to'],
-        $payload['subject'],
-        $payload['body']
-    );
+$worker = new Worker($queue, maxAttempts: 3, sleepSeconds: 1);
+$worker->work('emails', function (array $payload): void {
+    sendEmail($payload['to'], $payload['subject']);
 });
 ```
 
-### PostgreSQL Queue
+### Redis
 
 ```php
-<?php
-use PDO;
-use Tudorr89\Phpqdrv\QueueFactory;
-use Tudorr89\Phpqdrv\Worker;
+use Predis\Client;
+use RTIGLOBAL\Phpqdrv\Adapters\PredisAdapter;
+use RTIGLOBAL\Phpqdrv\Drivers\RedisQueue;
 
-// Create PDO connection
-$pdo = new PDO(
-    'pgsql:host=localhost;dbname=mydb',
-    'username',
-    'password'
-);
-
-// Create queue instance
-$queue = QueueFactory::createPostgreSQLQueue($pdo);
-
-// Similar job enqueuing and processing as Redis example
+$queue = new RedisQueue(new PredisAdapter(new Client('redis://127.0.0.1:6379')));
+// or: QueueFactory::predis(new Client(...));
+// or: QueueFactory::redis($anyRedisClientInterfaceImplementation);
 ```
 
-### Beanstalkd Queue
+### PostgreSQL / MariaDB
 
 ```php
-<?php
-use Net_Beanstalkd;
-use Tudorr89\Phpqdrv\QueueFactory;
-use Tudorr89\Phpqdrv\Worker;
+use RTIGLOBAL\Phpqdrv\QueueFactory;
 
-// Create Beanstalkd connection
-$beanstalkd = new Net_Beanstalkd('localhost', 11300);
-
-// Create queue instance
-$queue = QueueFactory::createBeanstalkdQueue($beanstalkd);
-
-// Similar job enqueuing and processing as previous examples
+$queue = QueueFactory::postgresql(new PDO('pgsql:host=localhost;dbname=app', 'user', 'pass'));
+$queue = QueueFactory::mariadb(new PDO('mysql:host=localhost;dbname=app', 'user', 'pass'));
 ```
 
-## 🛠 Advanced Configuration
-
-### Worker Configuration
+### Beanstalkd
 
 ```php
-// Customize worker behavior
+use Pheanstalk\Pheanstalk;
+use RTIGLOBAL\Phpqdrv\QueueFactory;
+
+$queue = QueueFactory::pheanstalk(new Pheanstalk('127.0.0.1', 11300));
+// or: QueueFactory::beanstalkd($anyBeanstalkdConnectionInterfaceImpl);
+```
+
+## Queue API
+
+```php
+interface QueueInterface
+{
+    public function push(string $queue, array $payload, int $delay = 0): JobInterface;
+    public function pop(string $queue): ?JobInterface;
+    public function ack(JobInterface $job): void;
+    public function fail(JobInterface $job): void;
+    public function release(JobInterface $job, int $delay = 0): void;
+    public function size(string $queue): int;
+    public function requeueExpired(): int;
+}
+```
+
+`Job::getAttempts()` reports the number of deliveries **including the current one**: a freshly pushed job reports `0`, the first delivery reports `1`.
+
+## Worker
+
+```php
 $worker = new Worker(
-    $queue,
-    $maxAttempts = 3,     // Maximum job retry attempts
-    $sleepTime = 5        // Seconds to wait between job checks
+    queue: $queue,
+    maxAttempts: 3,     // deliveries before a job is parked as failed
+    sleepSeconds: 1,    // idle polling interval
+    logger: $psrLogger, // optional PSR-3 logger
 );
+
+$worker->work('emails', $processor);              // daemon: runs until stopped
+$worker->work('emails', $processor, maxJobs: 50); // process 50 jobs, then return
+$worker->processNext('emails', $processor);       // handle a single job, returns false when empty
 ```
 
-## 📊 Queue Methods
+`work()` is a daemon loop: it keeps polling forever (until `maxJobs` jobs were *processed* or `stop()` is called). For cron-style runs use `processNext()` in your own bounded loop.
 
-Each queue driver implements these core methods:
+Failure policy:
 
-- `push(string $queue, array $payload)`: Add a new job to the queue
-- `pop(string $queue)`: Retrieve and remove a job from the queue
-- `ack(JobInterface $job)`: Acknowledge successful job completion
-- `fail(JobInterface $job)`: Mark a job as failed
-- `count(string $queue)`: Count pending jobs in a queue
+1. The processor throws `\Throwable` → job is logged and `release()`d with a backoff of 1s, 2s, 4s… (capped at 300s).
+2. Once `getAttempts() >= maxAttempts` → `fail()` parks the job in the dead letter store.
+3. Infrastructure errors (queue unreachable) are logged and retried; the worker never dies.
 
-## 🔒 Error Handling
+Graceful shutdown: `SIGTERM`/`SIGINT` (when `ext-pcntl` is available) finish the in-flight job, then the loop returns. Call `$worker->stop()` from your processor to stop after the current job.
 
-- Configurable max retry attempts
-- Automatic job failure after max attempts
-- Supports logging and custom error handling
+## Reliability model
 
-## 📋 Planned Features
+A job handed to a worker is *reserved*, not deleted:
 
-- [ ] Improved logging
-- [ ] More sophisticated retry strategies
-- [ ] Advanced job scheduling
-- [ ] Distributed queue support
+| Backend | How a reserved job survives a dead worker |
+|---|---|
+| SQLite / MariaDB / PostgreSQL | `status = 'processing'` + `reserved_at`; the worker periodically calls `requeueExpired()` |
+| Redis | body moved into a `reserved` sorted set scored by deadline; `requeueExpired()` puts it back |
+| Beanstalkd | the server's TTR handles it natively |
 
-## 🤝 Contributing
+Each driver takes a `visibilityTimeout` (default 300s) in its constructor. Set it slightly above your slowest job. Workers sweep every 30 seconds automatically.
+
+`fail()` writes to a dead letter store per backend: a `failed` status for SQL, a `{prefix}:{queue}:failed` list for Redis, a `{queue}.failed` tube for Beanstalkd.
+
+## Payloads
+
+Payloads are arrays encoded as JSON with strict error handling:
+
+- invalid UTF-8 or resources → `InvalidPayloadException` on push
+- corrupt stored payloads → `InvalidPayloadException` on pop
+- floats keep their zero fraction (`3.0` stays `3.0`)
+
+Payloads are stored as opaque JSON text on every backend, so they round-trip exactly. (PostgreSQL's `JSONB` would normalise key order; subclass `PostgreSQLQueue` and override `payloadSelectExpression()`/`payloadParameter()` if you want that trade-off.)
+
+## Schema
+
+Drivers create their table/index on construction (`ensureSchema()`), idempotently. For production, pass `ensureSchema: false` and apply the DDL yourself:
+
+```sql
+-- PostgreSQL
+CREATE TABLE queue_jobs (
+    id VARCHAR(64) PRIMARY KEY NOT NULL,
+    queue VARCHAR(191) NOT NULL,
+    payload TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    available_at BIGINT NOT NULL DEFAULT 0,
+    reserved_at BIGINT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+);
+CREATE INDEX queue_jobs_pop_idx ON queue_jobs (queue, status, available_at, created_at);
+```
+
+All timestamps are integer **microseconds** since the epoch. `status` is one of `pending`, `processing`, `completed`, `failed`.
+
+The underlying `PDO` is switched to `ERRMODE_EXCEPTION` — a queue that fails silently is worse than one that throws.
+
+## Running the tests
+
+```bash
+composer install
+vendor/bin/phpunit        # unit tests + SQLite integration tests
+vendor/bin/phpstan analyse
+```
+
+Redis, MariaDB and PostgreSQL tests are skipped unless their DSN is provided:
+
+```bash
+export QDRV_REDIS_DSN="redis://127.0.0.1:6379"
+export QDRV_MYSQL_DSN="mysql:host=127.0.0.1;port=3306;dbname=phpqdrv_test"
+export QDRV_MYSQL_USER=root QDRV_MYSQL_PASSWORD=
+export QDRV_PGSQL_DSN="pgsql:host=127.0.0.1;port=5432;dbname=phpqdrv_test"
+export QDRV_PGSQL_USER=postgres QDRV_PGSQL_PASSWORD=
+vendor/bin/phpunit
+```
+
+## Contributing
 
 1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
+3. Add tests and run `composer check`
+4. Open a Pull Request
 
-## 📜 License
+## License
 
-Distributed under the MIT License. See `LICENSE` for more information.
-
-## 🛟 Support
-
-If you encounter any issues or have questions, please file an issue on the GitHub repository.
+MIT — see [LICENSE.md](LICENSE.md).

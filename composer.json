@@ -1,33 +1,50 @@
 {
-    "name": "tudorr89/phpqdrv",
+    "name": "rtiglobal/phpqdrv",
     "description": "A simple queue system supporting multiple backends for PHP",
     "type": "library",
     "license": "MIT",
-    "autoload": {
-        "psr-4": {
-            "Tudorr89\\Phpqdrv\\": "src/"
-        }
-    },
     "require": {
         "php": "^8.1",
-        "predis/predis": "^2.0",
+        "ext-json": "*",
         "ext-pdo": "*",
-        "pear/net_beanstalkd": "^0.5.1",
-        "php-di/php-di": "^7.0"
+        "psr/log": "^1.1 || ^2.0 || ^3.0"
     },
     "require-dev": {
-        "phpunit/phpunit": "^9.5",
-        "mockery/mockery": "^1.4"
+        "pda/pheanstalk": "^5.0 || ^6.0",
+        "phpstan/phpstan": "^2.1",
+        "phpunit/phpunit": "^10.5 || ^11.5 || ^12.0",
+        "predis/predis": "^2.2"
     },
     "suggest": {
-        "ext-redis": "For using Redis queue driver",
-        "ext-pgsql": "For using PostgreSQL queue driver",
-        "ext-sqlite3": "For using SQLite queue driver"
+        "ext-pcntl": "Graceful worker shutdown on SIGTERM/SIGINT",
+        "ext-pdo_mysql": "For the MariaDB queue driver",
+        "ext-pdo_pgsql": "For the PostgreSQL queue driver",
+        "ext-pdo_sqlite": "For the SQLite queue driver",
+        "pda/pheanstalk": "For the Beanstalkd queue driver",
+        "predis/predis": "For the Redis queue driver"
+    },
+    "autoload": {
+        "psr-4": {
+            "RTIGLOBAL\\Phpqdrv\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "RTIGLOBAL\\Phpqdrv\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "stan": "phpstan analyse",
+        "check": ["@test", "@stan"]
+    },
+    "config": {
+        "sort-packages": true
     },
     "authors": [
         {
             "name": "Tudor Rusu",
-            "email": "tudorr89@gmail.com"
+            "email": "contact@rtiglobal.services"
         }
     ]
 }
